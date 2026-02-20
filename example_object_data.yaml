@@ -1,0 +1,10 @@
+objects:
+  - category: banana
+    color: yellow
+    size: [0.1, 0.03]
+  - category: apple
+    color: red
+    size: [0.08, 0.08]
+  - category: water
+    color: blue
+    size: [0.07, 0.07]

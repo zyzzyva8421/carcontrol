@@ -1,0 +1,13 @@
+[Unit]
+Description=ROS2 Servo Control Server
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/home/pi/run_ros2_server.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

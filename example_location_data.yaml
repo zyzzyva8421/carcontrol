@@ -1,0 +1,10 @@
+locations:
+  - category: table
+    color: brown
+    size: [0.6, 0.6]
+  - category: desk
+    color: gray
+    size: [0.5, 0.5]
+  - category: counter
+    color: beige
+    size: [0.7, 0.3]

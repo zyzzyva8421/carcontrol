@@ -1,0 +1,42 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+*.out
+*.err
+/tmp/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VSCode settings
+.vscode/
+
+# Python test output
+htmlcov/
+.coverage
+.tox/
+
+
+# Ignore Webots logs
+webots/logs/
+
+# Ignore auto_avoid.log
+auto_avoid.log

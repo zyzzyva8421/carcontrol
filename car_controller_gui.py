@@ -11,6 +11,13 @@ import shlex
 import io
 import urllib.request
 import time
+import asyncio
+import json
+try:
+    import websockets
+except Exception:  # pragma: no cover
+    websockets = None
+import subprocess
 
 try:
     from PIL import Image, ImageTk
@@ -58,8 +65,17 @@ class CarControllerGUI:
         self.camera_servo2_pin_var = tk.IntVar(value=11)  # J2: IO11 (SCLK)
         self.camera_servo3_pin_var = tk.IntVar(value=9)   # J3: IO9 (MISO)
         self.camera_backend_var = tk.StringVar(value="pigpio")
-        self.camera_center_j1_var = tk.IntVar(value=90)
-        self.camera_center_j3_var = tk.IntVar(value=90)
+        self.camera_center_j1_var = tk.IntVar(value=0)
+        self.camera_center_j3_var = tk.IntVar(value=0)
+        # WebSocket control settings (optional): if enabled, GUI will send
+        # servo commands directly to the Pi's websocket server instead of
+        # using SSH/remote commands.
+        self.ws_enabled_var = tk.BooleanVar(value=True)
+        self.ws_host_var = tk.StringVar(value=DEFAULT_HOST)
+        self.ws_port_var = tk.IntVar(value=8765)
+        self.ws_token_var = tk.StringVar(value="")
+        # ROS2 option: publish servo commands to /servo_control (std_msgs/String)
+        self.ros_enabled_var = tk.BooleanVar(value=False)
         self.camera_url_var = tk.StringVar(value=f"http://{DEFAULT_HOST}:8080/?action=snapshot")
         self.camera_preview_on_var = tk.BooleanVar(value=False)
         self._camera_preview_image = None
@@ -68,8 +84,45 @@ class CarControllerGUI:
         self.pressed_keys: set[str] = set()
 
         self._build_ui()
+        # When websocket is enabled, try to fetch the token from the Pi
+        # so the GUI is pre-filled with the correct secret. This uses the
+        # same SSH settings the GUI already holds.
+        self.ws_enabled_var.trace_add("write", lambda *a: self._on_ws_enabled_changed())
         self._bind_keys()
         self._schedule_sensor_refresh()
+
+    def _on_ws_enabled_changed(self) -> None:
+        if not self.ws_enabled_var.get():
+            return
+        # fetch token from remote Pi if available
+        threading.Thread(target=self._fetch_ws_token_from_pi, daemon=True).start()
+
+    def _fetch_ws_token_from_pi(self) -> None:
+        config = self._current_config()
+        ssh_cmd = [
+            "ssh",
+            "-p",
+            str(config.port),
+            "-o",
+            f"ConnectTimeout={config.connect_timeout}",
+            "-o",
+            f"StrictHostKeyChecking={config.strict_host_key_checking}",
+        ]
+        if config.identity_file:
+            ssh_cmd.extend(["-i", config.identity_file])
+        ssh_cmd.append(f"{config.user}@{config.host}")
+        ssh_cmd.append("cat /home/pi/ws_token.txt || true")
+
+        try:
+            proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=6)
+            if proc.returncode == 0 and proc.stdout:
+                token = proc.stdout.strip()
+                self.root.after(0, lambda: self.ws_token_var.set(token))
+                self.root.after(0, lambda: self.status_var.set("Fetched WS token from Pi"))
+            else:
+                self.root.after(0, lambda: self.status_var.set("WS token not found on Pi"))
+        except Exception:
+            self.root.after(0, lambda: self.status_var.set("Failed to fetch WS token"))
 
     def _build_ui(self) -> None:
         root_frame = ttk.Frame(self.root, padding=8)
@@ -265,6 +318,16 @@ class CarControllerGUI:
             row=6, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
 
+        # WebSocket controls (optional)
+        ttk.Checkbutton(config_frame, text="Use WebSocket", variable=self.ws_enabled_var).grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(config_frame, text="WS Host").grid(row=4, column=1, sticky="w")
+        ttk.Entry(config_frame, textvariable=self.ws_host_var, width=14).grid(row=4, column=2, sticky="w")
+        ttk.Label(config_frame, text="WS Port").grid(row=4, column=3, sticky="w")
+        ttk.Entry(config_frame, textvariable=self.ws_port_var, width=6).grid(row=4, column=4, sticky="w")
+        ttk.Label(config_frame, text="WS Token").grid(row=4, column=5, sticky="w")
+        ttk.Entry(config_frame, textvariable=self.ws_token_var, width=16).grid(row=4, column=6, columnspan=2, sticky="w")
+        ttk.Checkbutton(config_frame, text="Use ROS2", variable=self.ros_enabled_var).grid(row=4, column=8, sticky="w", padx=(8,0))
+
         # Debug / calibration: manual center controls for J1 (horizontal) and J3 (vertical)
         ttk.Label(camera_frame, text="J1 Center (deg)").grid(row=6, column=3, sticky="w", padx=(8, 0))
         ttk.Entry(camera_frame, textvariable=self.camera_center_j1_var, width=5).grid(row=6, column=4, sticky="w")
@@ -396,10 +459,10 @@ class CarControllerGUI:
 
     def _prepare_manual_control(self, config: SSHConfig) -> bool:
         conflict_kill = (
-            "pkill -f '^python .*auto_avoid.py( |$)' >/dev/null 2>&1 || true; "
-            "pkill -f '^python .*master_system_control.py( |$)' >/dev/null 2>&1 || true; "
-            "pkill -f '^python .*wechat_control.py( |$)' >/dev/null 2>&1 || true; "
-            "pkill -f '^python .*PS2_control.py( |$)' >/dev/null 2>&1 || true; "
+              "pkill -f '^python3 .*auto_avoid.py( |$)' >/dev/null 2>&1 || true; "
+              "pkill -f '^python3 .*master_system_control.py( |$)' >/dev/null 2>&1 || true; "
+              "pkill -f '^python3 .*wechat_control.py( |$)' >/dev/null 2>&1 || true; "
+              "pkill -f '^python3 .*PS2_control.py( |$)' >/dev/null 2>&1 || true; "
             "pkill -x bluetooth_control >/dev/null 2>&1 || true; "
             "pkill -f '^sh /home/pi/labboot.sh$' >/dev/null 2>&1 || true; "
             "pkill -f '^sh /home/pi/lingshunlabboot.sh$' >/dev/null 2>&1 || true"
@@ -411,24 +474,47 @@ class CarControllerGUI:
         config = self._current_config()
         template = self.template_var.get().strip()
         speed = self.speed_var.get()
+        ws_enabled = self.ws_enabled_var.get()
 
         self.status_var.set(f"Sending: {action}")
 
         def worker() -> None:
             movement_actions = {"forward", "backward", "left", "right", "stop"}
+            if ws_enabled:
+                # WebSocket mode
+                msg = {"type": "action", "action": action, "speed": speed}
+                host = self.ws_host_var.get().strip()
+                port = int(self.ws_port_var.get())
+                token = self.ws_token_var.get().strip()
+                uri = f"ws://{host}:{port}"
+                async def _send():
+                    import websockets
+                    async with websockets.connect(uri) as ws:
+                        if token:
+                            msg["token"] = token
+                        await ws.send(json.dumps(msg))
+                        resp = await ws.recv()
+                        return resp
+                try:
+                    text = asyncio.run(_send())
+                    self.root.after(0, lambda: self._update_status_from_action(action))
+                    self.root.after(0, lambda: self.status_var.set(f"WS OK: {action}"))
+                except Exception as exc:
+                    self.root.after(0, lambda exc=exc: self.status_var.set(f"WS Failed: {exc}"))
+                return
+
+            # SSH mode
             if action in movement_actions:
                 ok = self._prepare_manual_control(config)
                 if not ok:
                     self.root.after(0, lambda: self.status_var.set("Failed to take manual control"))
                     return
-
             try:
                 remote_command = template.format(action=action, speed=speed)
             except KeyError as error:
                 message = f"Template error: missing field {error}"
                 self.root.after(0, lambda: self.status_var.set(message))
                 return
-
             code = run_remote_command(config, remote_command, dry_run=False)
             if code == 2 and "--speed" in remote_command:
                 fallback_command = re.sub(r"\s--speed\s+\S+", "", remote_command).strip()
@@ -469,15 +555,38 @@ class CarControllerGUI:
         auto_path = self.auto_path_var.get().strip()
         threshold = self.auto_threshold_var.get()
         speed = self.speed_var.get()
-
-        remote_command = (
-            f"nohup python {shlex.quote(auto_path)} --threshold-cm {threshold} --speed {speed} "
-            f"> /tmp/auto_avoid.log 2>&1 &"
-        )
+        ws_enabled = self.ws_enabled_var.get()
 
         self.status_var.set("Starting auto avoid...")
 
         def worker() -> None:
+            if ws_enabled:
+                msg = {"type": "auto", "script": auto_path, "threshold_cm": threshold, "speed": speed}
+                host = self.ws_host_var.get().strip()
+                port = int(self.ws_port_var.get())
+                token = self.ws_token_var.get().strip()
+                uri = f"ws://{host}:{port}"
+                async def _send():
+                    import websockets
+                    async with websockets.connect(uri) as ws:
+                        if token:
+                            msg["token"] = token
+                        await ws.send(json.dumps(msg))
+                        resp = await ws.recv()
+                        return resp
+                try:
+                    text = asyncio.run(_send())
+                    self.root.after(0, lambda: self.mode_var.set("Auto"))
+                    self.root.after(0, lambda: self.direction_var.set("Auto Avoid"))
+                    self.root.after(0, lambda: self.status_var.set("WS Auto started"))
+                except Exception as exc:
+                    self.root.after(0, lambda exc=exc: self.status_var.set(f"WS Auto failed: {exc}"))
+                return
+
+            remote_command = (
+                    f"nohup python3 {shlex.quote(auto_path)} --threshold-cm {threshold} --speed {speed} "
+                f"> /tmp/auto_avoid.log 2>&1 &"
+            )
             code = run_remote_command(config, remote_command, dry_run=False)
             if code == 0:
                 self.root.after(0, lambda: self.mode_var.set("Auto"))
@@ -491,10 +600,34 @@ class CarControllerGUI:
 
     def stop_auto(self) -> None:
         config = self._current_config()
+        ws_enabled = self.ws_enabled_var.get()
 
         self.status_var.set("Stopping auto avoid...")
 
         def worker() -> None:
+            if ws_enabled:
+                msg = {"type": "stop_auto"}
+                host = self.ws_host_var.get().strip()
+                port = int(self.ws_port_var.get())
+                token = self.ws_token_var.get().strip()
+                uri = f"ws://{host}:{port}"
+                async def _send():
+                    import websockets
+                    async with websockets.connect(uri) as ws:
+                        if token:
+                            msg["token"] = token
+                        await ws.send(json.dumps(msg))
+                        resp = await ws.recv()
+                        return resp
+                try:
+                    text = asyncio.run(_send())
+                    self.root.after(0, lambda: self.mode_var.set("Manual"))
+                    self.root.after(0, lambda: self.direction_var.set("Stopped"))
+                    self.root.after(0, lambda: self.status_var.set("WS Auto stopped"))
+                except Exception as exc:
+                    self.root.after(0, lambda exc=exc: self.status_var.set(f"WS Stop auto failed: {exc}"))
+                return
+
             code = run_remote_command(config, "pkill -f '^python .*auto_avoid.py( |$)' >/dev/null 2>&1 || true", dry_run=False)
             template = self.template_var.get().strip()
             speed = self.speed_var.get()
@@ -547,7 +680,7 @@ class CarControllerGUI:
             self.status_var.set("Reading IR sensors...")
 
         remote_command = (
-            "python - <<'PY'\n"
+                "python3 - <<'PY'\n"
             "import RPi.GPIO as GPIO\n"
             "LEFT=12\n"
             "RIGHT=17\n"
@@ -698,6 +831,90 @@ class CarControllerGUI:
         else:
             return self.camera_servo3_pin_var
 
+    def _ws_send_command(self, servo: int, angle: float, pin: int, backend: str) -> dict:
+        """Send a servo command over WebSocket and return parsed JSON response.
+
+        Returns a dict with server response or an error field.
+        """
+        if websockets is None:
+            return {"error": "websockets package not available"}
+
+        host = self.ws_host_var.get().strip()
+        port = int(self.ws_port_var.get())
+        token = self.ws_token_var.get().strip()
+        uri = f"ws://{host}:{port}"
+
+        async def _send() -> str:
+            async with websockets.connect(uri) as ws:
+                msg = {"type": "servo", "servo": servo, "angle": angle, "pin": pin, "backend": backend}
+                if token:
+                    msg["token"] = token
+                await ws.send(json.dumps(msg))
+                resp = await ws.recv()
+                return resp
+
+        try:
+            text = asyncio.run(_send())
+        except Exception as exc:  # pragma: no cover - runtime network error
+            return {"error": str(exc)}
+
+        try:
+            return json.loads(text)
+        except Exception:
+            return {"raw": text}
+
+    def _ros_publish_command(self, servo: int, angle: float, pin: int, backend: str) -> dict:
+        """Publish a servo command using ROS2 CLI (fallback) as JSON string on /servo_control.
+
+        Uses `ros2 topic pub -1 /servo_control std_msgs/msg/String "data: '{...}'"`.
+        Requires ROS2 `ros2` CLI available on this machine and that ROS network is configured.
+        """
+        msg = json.dumps({"type": "servo", "servo": servo, "angle": angle, "pin": pin, "backend": backend})
+
+        # Prefer using rclpy to publish directly when available (no external CLI required).
+        try:
+            import rclpy
+            from std_msgs.msg import String
+        except Exception:
+            rclpy = None
+
+        if rclpy is not None:
+            try:
+                rclpy.init()
+                node = rclpy.create_node("car_controller_gui_pub")
+                pub = node.create_publisher(String, "/servo_control", 10)
+                m = String()
+                m.data = msg
+                pub.publish(m)
+                # give middleware a moment to send
+                try:
+                    rclpy.spin_once(node, timeout_sec=0.1)
+                except Exception:
+                    pass
+                node.destroy_node()
+                rclpy.shutdown()
+                return {"returncode": 0, "stdout": "published via rclpy"}
+            except Exception as exc:
+                return {"error": f"rclpy publish failed: {exc}"}
+
+        # Fallback to using the ros2 CLI if rclpy is unavailable.
+        cmd = [
+            "ros2",
+            "topic",
+            "pub",
+            "/servo_control",
+            "std_msgs/msg/String",
+            f"data: '{msg}'",
+            "-1",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+        except FileNotFoundError:
+            return {"error": "ros2 CLI not found"}
+        except Exception as exc:
+            return {"error": str(exc)}
+
     # Using absolute 0-180 domain for all servos.
 
     def move_camera(self, delta: int, servo: int = 1) -> None:
@@ -728,11 +945,32 @@ class CarControllerGUI:
         )
 
         def worker() -> None:
-            code = run_remote_command(config, remote_command, dry_run=False)
-            if code == 0:
-                message = f"Servo {servo} angle set: {servo_angle}"
+            # Prefer ROS2 publishing when enabled, then WebSocket, then SSH
+            if self.ros_enabled_var.get():
+                resp = self._ros_publish_command(servo, servo_angle, pin, backend)
+                if isinstance(resp, dict) and resp.get("returncode", 1) == 0:
+                    message = f"Servo {servo} angle set: {servo_angle} (ros)"
+                elif isinstance(resp, dict) and resp.get("error"):
+                    message = f"Servo {servo} control failed (ros:{resp})"
+                else:
+                    message = f"Servo {servo} control unexpected response (ros:{resp})"
+            elif self.ws_enabled_var.get():
+                # send via websocket to Pi
+                resp = self._ws_send_command(servo, servo_angle, pin, backend)
+                if isinstance(resp, dict) and resp.get("returncode", 1) == 0:
+                    message = f"Servo {servo} angle set: {servo_angle}"
+                else:
+                    message = f"Servo {servo} control failed (ws:{resp})"
             else:
-                message = f"Servo {servo} control failed ({code})"
+                code = run_remote_command(
+                    config,
+                    f"python /home/pi/camera_servo.py --servo {servo} --pin {pin} --angle {servo_angle} --backend {backend}",
+                    dry_run=False,
+                )
+                if code == 0:
+                    message = f"Servo {servo} angle set: {servo_angle}"
+                else:
+                    message = f"Servo {servo} control failed ({code})"
             self.root.after(0, lambda: self.status_var.set(message))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -757,11 +995,19 @@ class CarControllerGUI:
                     send_angle = int(angle)
                 else:
                     send_angle = self._display_to_servo_angle(servo, int(angle))
-                code = run_remote_command(
-                    config,
-                    f"python /home/pi/camera_servo.py --servo {servo} --pin {pin} --angle {send_angle} --backend {backend}",
-                    dry_run=False,
-                )
+                # Prefer ROS2 -> WebSocket -> SSH
+                if self.ros_enabled_var.get():
+                    resp = self._ros_publish_command(servo, send_angle, pin, backend)
+                    code = 0 if (isinstance(resp, dict) and resp.get("returncode", 1) == 0) else 1
+                elif self.ws_enabled_var.get():
+                    resp = self._ws_send_command(servo, send_angle, pin, backend)
+                    code = 0 if (isinstance(resp, dict) and resp.get("returncode", 1) == 0) else 1
+                else:
+                    code = run_remote_command(
+                        config,
+                        f"python /home/pi/camera_servo.py --servo {servo} --pin {pin} --angle {send_angle} --backend {backend}",
+                        dry_run=False,
+                    )
                 if code != 0:
                     self.root.after(0, lambda c=code: self.status_var.set(f"Servo {servo} self-test failed ({c})"))
                     return
@@ -788,17 +1034,29 @@ class CarControllerGUI:
         self.status_var.set(f"Setting servo {servo} center to {angle}...")
 
         def worker() -> None:
-            code = run_remote_command(
-                config,
-                f"python /home/pi/camera_servo.py --servo {servo} --pin {pin} --angle {angle} --backend {backend}",
-                dry_run=False,
-            )
-            if code == 0:
-                # report success but do NOT change slider display so user can continue
-                # to use relative controls even when the configured center is 0
-                self.root.after(0, lambda: self.status_var.set(f"Servo {servo} center set: {angle}"))
+            # Prefer ROS2 -> WebSocket -> SSH
+            if self.ros_enabled_var.get():
+                resp = self._ros_publish_command(servo, angle, pin, backend)
+                if isinstance(resp, dict) and resp.get("returncode", 1) == 0:
+                    self.root.after(0, lambda: self.status_var.set(f"Servo {servo} center set: {angle}"))
+                else:
+                    self.root.after(0, lambda: self.status_var.set(f"Set center failed (ros:{resp})"))
+            elif self.ws_enabled_var.get():
+                resp = self._ws_send_command(servo, angle, pin, backend)
+                if isinstance(resp, dict) and resp.get("returncode", 1) == 0:
+                    self.root.after(0, lambda: self.status_var.set(f"Servo {servo} center set: {angle}"))
+                else:
+                    self.root.after(0, lambda: self.status_var.set(f"Set center failed (ws:{resp})"))
             else:
-                self.root.after(0, lambda: self.status_var.set(f"Set center failed ({code})"))
+                code = run_remote_command(
+                    config,
+                    f"python /home/pi/camera_servo.py --servo {servo} --pin {pin} --angle {angle} --backend {backend}",
+                    dry_run=False,
+                )
+                if code == 0:
+                    self.root.after(0, lambda: self.status_var.set(f"Servo {servo} center set: {angle}"))
+                else:
+                    self.root.after(0, lambda: self.status_var.set(f"Set center failed ({code})"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -842,10 +1100,22 @@ class CarControllerGUI:
         self.status_var.set("Auto-correcting camera (using configured centers)...")
 
         def worker() -> None:
-            cmd_h = f"python /home/pi/camera_servo.py --servo {servo_h} --pin {pin_h} --angle {angle_h} --backend {backend}"
-            code_h = run_remote_command(config, cmd_h, dry_run=False)
-            cmd_v = f"python /home/pi/camera_servo.py --servo {servo_v} --pin {pin_v} --angle {angle_v} --backend {backend}"
-            code_v = run_remote_command(config, cmd_v, dry_run=False)
+            # Prefer ROS2 -> WebSocket -> SSH
+            if self.ros_enabled_var.get():
+                resp_h = self._ros_publish_command(servo_h, angle_h, pin_h, backend)
+                code_h = 0 if (isinstance(resp_h, dict) and resp_h.get("returncode", 1) == 0) else 1
+                resp_v = self._ros_publish_command(servo_v, angle_v, pin_v, backend)
+                code_v = 0 if (isinstance(resp_v, dict) and resp_v.get("returncode", 1) == 0) else 1
+            elif self.ws_enabled_var.get():
+                resp_h = self._ws_send_command(servo_h, angle_h, pin_h, backend)
+                code_h = 0 if (isinstance(resp_h, dict) and resp_h.get("returncode", 1) == 0) else 1
+                resp_v = self._ws_send_command(servo_v, angle_v, pin_v, backend)
+                code_v = 0 if (isinstance(resp_v, dict) and resp_v.get("returncode", 1) == 0) else 1
+            else:
+                cmd_h = f"python /home/pi/camera_servo.py --servo {servo_h} --pin {pin_h} --angle {angle_h} --backend {backend}"
+                code_h = run_remote_command(config, cmd_h, dry_run=False)
+                cmd_v = f"python /home/pi/camera_servo.py --servo {servo_v} --pin {pin_v} --angle {angle_v} --backend {backend}"
+                code_v = run_remote_command(config, cmd_v, dry_run=False)
 
             # Do not modify slider display; keep sliders at their defaults
             # so the user can continue using relative controls even when

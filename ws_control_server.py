@@ -31,6 +31,7 @@ DEFAULT_SERVO_PINS = {
 
 
 async def handle(ws: websockets.WebSocketServerProtocol, path: str, token: str) -> None:
+
     # Basic token check via query string: ws://host:port/?token=...
     q = ws.request_headers.get("Sec-WebSocket-Protocol")
     # We also accept token in first message for simplicity
@@ -48,6 +49,37 @@ async def handle(ws: websockets.WebSocketServerProtocol, path: str, token: str) 
                 if provided != token:
                     await ws.send(json.dumps({"error": "unauthorized"}))
                     continue
+
+            if data.get("type") == "auto":
+                # Start auto_avoid.py with provided options
+                script = data.get("script", "/home/pi/auto_avoid.py")
+                threshold = data.get("threshold_cm", 30)
+                speed = data.get("speed", 45)
+                shell_cmd = f"nohup python3 {shlex.quote(script)} --threshold-cm {threshold} --speed {speed} > /tmp/auto_avoid.log 2>&1 &"
+                print(f"[WS DEBUG] Running auto: {shell_cmd}")
+                proc = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True)
+                resp = {
+                    "cmd": shell_cmd,
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                }
+                await ws.send(json.dumps(resp))
+                continue
+
+            if data.get("type") == "stop_auto":
+                # Kill auto_avoid.py process
+                shell_cmd = "pkill -f auto_avoid.py"
+                print(f"[WS DEBUG] Stopping auto: {shell_cmd}")
+                proc = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True)
+                resp = {
+                    "cmd": shell_cmd,
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                }
+                await ws.send(json.dumps(resp))
+                continue
 
             if data.get("type") == "servo":
                 servo = int(data.get("servo", 3))
@@ -81,6 +113,36 @@ async def handle(ws: websockets.WebSocketServerProtocol, path: str, token: str) 
                 await ws.send(json.dumps(resp))
                 continue
 
+            if data.get("type") == "action":
+                action = data.get("action")
+                speed = data.get("speed", 45)
+                print(f"[WS DEBUG] Received action: {action}, speed: {speed}, data: {data}")
+                if action in {"forward", "backward", "left", "right", "stop", "speed_up", "speed_down", "horn", "lights"}:
+                    # Only pass speed for speed_up/speed_down if needed, not for drive actions
+                    if action in {"forward", "backward", "left", "right", "stop"}:
+                        cmd = [
+                            "python3",
+                            "/home/pi/car_action.py",
+                            action
+                        ]
+                    else:
+                        cmd = [
+                            "python3",
+                            "/home/pi/car_action.py",
+                            action
+                        ]
+                    print(f"[WS DEBUG] Running command: {' '.join(cmd)}")
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    print(f"[WS DEBUG] Subprocess returncode: {proc.returncode}, stdout: {proc.stdout!r}, stderr: {proc.stderr!r}")
+                    resp: Dict[str, Any] = {
+                        "cmd": " ".join(shlex.quote(p) for p in cmd),
+                        "returncode": proc.returncode,
+                        "stdout": proc.stdout,
+                        "stderr": proc.stderr,
+                    }
+                    await ws.send(json.dumps(resp))
+                    continue
+
             # Unknown message
             await ws.send(json.dumps({"error": "unsupported command type"}))
     except websockets.exceptions.ConnectionClosed:
@@ -92,7 +154,16 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--token", default="", help="Simple auth token (optional)")
+    parser.add_argument("--token-file", default="", help="Path to a file containing the token (optional)")
     args = parser.parse_args()
+
+    # If a token file is provided and no explicit token was passed, read it.
+    if not args.token and args.token_file:
+        try:
+            with open(args.token_file, "r") as f:
+                args.token = f.read().strip()
+        except Exception:
+            args.token = ""
 
     async def run() -> None:
         async with websockets.serve(lambda ws, path: handle(ws, path, args.token), args.host, args.port):

@@ -4,6 +4,28 @@
 import argparse
 import time
 import statistics
+import ultrasonic_sensor
+import json
+import threading
+try:
+    import websockets
+except ImportError:
+    websockets = None
+
+def ws_broadcast_status(status):
+    # Send status to WebSocket server (localhost:9000)
+    try:
+        import asyncio
+        async def send():
+            uri = "ws://127.0.0.1:9000"
+            try:
+                async with websockets.connect(uri) as ws:
+                    await ws.send(json.dumps(status))
+            except Exception:
+                pass
+        threading.Thread(target=lambda: asyncio.run(send()), daemon=True).start()
+    except Exception:
+        pass
 try:
     import RPi.GPIO as GPIO
 except ImportError:
@@ -37,7 +59,7 @@ TRIG_PIN = 1
 AVOID_LEFT = 12
 AVOID_RIGHT = 17
 # Default servo pin for ultrasonic mount (J1). Can be overridden with --servo-pin
-DEFAULT_ULTRA_SERVO_PIN = 16
+DEFAULT_ULTRA_SERVO_PIN = 23
 
 
 def build_parser():
@@ -110,22 +132,18 @@ def is_blocked_right():
 
 
 def measure_distance_cm(timeout_seconds=0.03):
-    GPIO.output(TRIG_PIN, GPIO.HIGH)
-    time.sleep(0.000015)
-    GPIO.output(TRIG_PIN, GPIO.LOW)
-
-    start_wait = time.time()
-    while GPIO.input(ECHO_PIN) == GPIO.LOW:
-        if time.time() - start_wait > timeout_seconds:
-            return None
-
-    pulse_start = time.time()
-    while GPIO.input(ECHO_PIN) == GPIO.HIGH:
-        if time.time() - pulse_start > timeout_seconds:
-            return None
-
-    pulse_end = time.time()
-    return (pulse_end - pulse_start) * 17150.0
+        """Return the median of several ultrasonic sensor readings for robustness."""
+        readings = []
+        samples = 5
+        delay = 0.03
+        for _ in range(samples):
+            d = ultrasonic_sensor.get_distance_cm()
+            if d is not None and 2 < d < 400:
+                readings.append(d)
+            time.sleep(delay)
+        if readings:
+            return statistics.median(readings)
+        return None
 
 
 def choose_turn(left_blocked, right_blocked, prefer_left):
@@ -229,8 +247,16 @@ def choose_direction_fused(left_blocked, right_blocked, sweep, threshold_cm, pre
 
 
 def main():
+    stuck_counter = 0
+    stuck_threshold = 10  # Number of cycles with no progress before stuck
+    last_distance = None
+    last_left_blocked = None
+    last_right_blocked = None
+    stuck_triggered = False
     args = build_parser().parse_args()
-    speed = max(20, min(100, int(args.speed)))
+    normal_speed = 30
+    slow_speed = 15
+    speed = normal_speed
     loop_seconds = max(0.02, float(args.loop_seconds))
     threshold_cm = max(10.0, float(args.threshold_cm))
     back_seconds = max(0.05, float(args.back_seconds))
@@ -241,10 +267,13 @@ def main():
 
     try:
         # Track repeated turns
-        last_turn = None
+        stuck_threshold = 10  # Number of cycles with no progress before stuck
         turn_count = 0
         turn_repeat_limit = 3  # Move backward after 3 repeated turns
         sweep_enabled = True  # Enable sweep logic
+
+        prev_distance = None
+        emergency_brake_triggered = False
 
         while True:
             left_blocked = is_blocked_left()
@@ -252,19 +281,189 @@ def main():
             distance = measure_distance_cm()
             too_close = distance is not None and distance < threshold_cm
 
-            stuck = False
-            if too_close or left_blocked or right_blocked:
+            # Stuck detection: if distance and IR sensors unchanged for stuck_threshold cycles
+            if (distance == last_distance and left_blocked == last_left_blocked and right_blocked == last_right_blocked):
+                stuck_counter += 1
+            else:
+                stuck_counter = 0
+            last_distance = distance
+            last_left_blocked = left_blocked
+            last_right_blocked = right_blocked
+
+            stuck_triggered = stuck_counter >= stuck_threshold
+            # If stuck, sweep with ultrasonic sensor to find the best way out
+            if stuck_triggered:
+                print("[STUCK] Car appears stuck. Sweeping to find way out.")
                 brake()
+                ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "sweeping"})
+                time.sleep(0.1)
+                sweep = None
+                if camera_servo is not None:
+                    sweep = sweep_distances(DEFAULT_ULTRA_SERVO_PIN, center_angle=90, delta_deg=40, samples=3, hold_s=0.12)
+                    print(f"[STUCK] Sweep results: {sweep}")
+                if sweep:
+                    fused_dir = choose_direction_fused(left_blocked, right_blocked, sweep, threshold_cm, prefer_left)
+                    print(f"[STUCK] Fused direction: {fused_dir}")
+                    if fused_dir == 'left':
+                        turn_left()
+                        ws_broadcast_status({"direction": "left", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "left"})
+                        time.sleep(turn_seconds)
+                        brake()
+                        ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "center"})
+                    elif fused_dir == 'right':
+                        turn_right()
+                        ws_broadcast_status({"direction": "right", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "right"})
+                        time.sleep(turn_seconds)
+                        brake()
+                        ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "center"})
+                    else:
+                        move_backward()
+                        ws_broadcast_status({"direction": "backward", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "center"})
+                        time.sleep(back_seconds)
+                        brake()
+                        ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True, "stuck": True, "ultra_servo": "center"})
+                stuck_counter = 0
+                continue
+
+
+
+            # Emergency reverse if ultrasonic sensor detects very close object (<10cm)
+            if distance is not None and distance < 10.0:
+                print("[ULTRA-EMERGENCY] Ultrasonic sensor detected object <10cm! Immediate brake and reverse.")
+                speed = slow_speed
+                pwm_ena.ChangeDutyCycle(speed)
+                pwm_enb.ChangeDutyCycle(speed)
+                brake()
+                ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": True, "obstacle": True})
+                time.sleep(0.05)
+                move_backward()
+                ws_broadcast_status({"direction": "backward", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": True, "obstacle": True})
+                time.sleep(back_seconds)
+                brake()
+                ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": True, "obstacle": True})
+                time.sleep(0.05)
+                continue
+
+            # Aggressive reaction to side IR sensors
+            if left_blocked or right_blocked:
+                print("[AGGRESSIVE] Side IR sensor triggered! Immediate brake and reverse.")
+                speed = slow_speed
+                pwm_ena.ChangeDutyCycle(speed)
+                pwm_enb.ChangeDutyCycle(speed)
+                brake()
+                ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True})
+                time.sleep(0.05)
+                move_backward()
+                ws_broadcast_status({"direction": "backward", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True})
+                time.sleep(back_seconds)
+                brake()
+                ws_broadcast_status({"direction": "brake", "speed": speed, "left_blocked": left_blocked, "right_blocked": right_blocked, "distance": distance, "threshold_cm": threshold_cm, "too_close": too_close, "emergency_brake": False, "obstacle": True})
+                time.sleep(0.05)
+                continue
+
+            # Dynamic speed adjustment
+            if too_close:
+                speed = slow_speed
+            else:
+                speed = normal_speed
+            pwm_ena.ChangeDutyCycle(speed)
+            pwm_enb.ChangeDutyCycle(speed)
+
+            # Emergency brake: stop and reverse if distance drops rapidly
+            emergency_brake = False
+            if prev_distance is not None and distance is not None:
+                if prev_distance > threshold_cm and distance < (threshold_cm * 0.5):
+                    print(f"[EMERGENCY BRAKE] Distance dropped from {prev_distance:.2f} to {distance:.2f}")
+                    emergency_brake = True
+
+            prev_distance = distance
+
+            # Debug output
+            print(f"[DEBUG] left_blocked={left_blocked}, right_blocked={right_blocked}, distance={distance}, threshold_cm={threshold_cm}, too_close={too_close}, emergency_brake={emergency_brake}, speed={speed}")
+
+            # Broadcast status
+            status = {
+                "direction": "stopped",  # Will update below
+                "speed": speed,
+                "left_blocked": left_blocked,
+                "right_blocked": right_blocked,
+                "distance": distance,
+                "threshold_cm": threshold_cm,
+                "too_close": too_close,
+                "emergency_brake": emergency_brake
+            }
+
+            stuck = False
+            if emergency_brake:
+                brake()
+                status["direction"] = "brake"
+                ws_broadcast_status(status)
+                time.sleep(0.05)
+                move_backward()
+                status["direction"] = "backward"
+                ws_broadcast_status(status)
+                time.sleep(back_seconds)
+                brake()
+                status["direction"] = "brake"
+                ws_broadcast_status(status)
+                time.sleep(0.05)
+                continue
+
+            if too_close or left_blocked or right_blocked:
+                status["obstacle"] = True
+                print("[DEBUG] Obstacle detected: ", end="")
+                if too_close:
+                    print(f"distance {distance:.2f} < threshold {threshold_cm}", end="; ")
+                if left_blocked:
+                    print("left blocked", end="; ")
+                if right_blocked:
+                    print("right blocked", end="; ")
+                print()
+                brake()
+                status["direction"] = "brake"
+                ws_broadcast_status(status)
                 time.sleep(0.05)
 
                 if left_blocked and right_blocked:
+                    print("[DEBUG] Both sides blocked, moving backward.")
                     move_backward()
+                    status["direction"] = "backward"
+                    ws_broadcast_status(status)
                     time.sleep(back_seconds)
                     brake()
+                    status["direction"] = "brake"
+                    ws_broadcast_status(status)
                     time.sleep(0.05)
                     stuck = True
 
+                # Always sweep with ultrasonic sensor before turning
+                sweep = None
+                if camera_servo is not None:
+                    print("[DEBUG] Performing ultrasonic sweep.")
+                    sweep = sweep_distances(DEFAULT_ULTRA_SERVO_PIN, center_angle=90, delta_deg=40, samples=3, hold_s=0.12)
+                    print(f"[DEBUG] Sweep results: {sweep}")
+
+                if sweep:
+                    fused_dir = choose_direction_fused(left_blocked, right_blocked, sweep, threshold_cm, prefer_left)
+                    print(f"[DEBUG] Fused direction: {fused_dir}")
+                    if fused_dir == 'left':
+                        turn_left()
+                        status["direction"] = "left"
+                    elif fused_dir == 'right':
+                        turn_right()
+                        status["direction"] = "right"
+                    else:
+                        move_backward()
+                        status["direction"] = "backward"
+                    ws_broadcast_status(status)
+                    time.sleep(turn_seconds)
+                    brake()
+                    status["direction"] = "brake"
+                    ws_broadcast_status(status)
+                    continue  # Skip normal turn logic
+
                 turn = choose_turn(left_blocked, right_blocked, prefer_left)
+                print(f"[DEBUG] Chosen turn: {turn}")
                 prefer_left = not prefer_left
 
                 # Count repeated turns
@@ -276,37 +475,34 @@ def main():
 
                 # If stuck turning, try backward
                 if turn_count >= turn_repeat_limit:
+                    print("[DEBUG] Too many repeated turns, moving backward.")
                     move_backward()
+                    status["direction"] = "backward"
+                    ws_broadcast_status(status)
                     time.sleep(back_seconds)
                     brake()
+                    status["direction"] = "brake"
+                    ws_broadcast_status(status)
                     time.sleep(0.05)
                     turn_count = 0  # Reset after backward
                     stuck = True
 
-                # Sweep ultrasonic sensor if stuck
-                if sweep_enabled and stuck and camera_servo is not None:
-                    sweep = sweep_distances(DEFAULT_ULTRA_SERVO_PIN, center_angle=90, delta_deg=40, samples=3, hold_s=0.12)
-                    if sweep:
-                        fused_dir = choose_direction_fused(left_blocked, right_blocked, sweep, threshold_cm, prefer_left)
-                        if fused_dir == 'left':
-                            turn_left()
-                        elif fused_dir == 'right':
-                            turn_right()
-                        else:
-                            move_backward()
-                        time.sleep(turn_seconds)
-                        brake()
-                        continue  # Skip normal turn logic
-
                 if turn == 'left':
                     turn_left()
+                    status["direction"] = "left"
                 else:
                     turn_right()
+                    status["direction"] = "right"
+                ws_broadcast_status(status)
                 time.sleep(turn_seconds)
                 brake()
+                status["direction"] = "brake"
+                ws_broadcast_status(status)
             else:
                 move_forward()
+                status["direction"] = "forward"
                 turn_count = 0  # Reset if moving forward
+                ws_broadcast_status(status)
 
             time.sleep(loop_seconds)
     except KeyboardInterrupt:
@@ -315,6 +511,10 @@ def main():
         brake()
         pwm_ena.stop()
         pwm_enb.stop()
+        try:
+            ultrasonic_sensor.cleanup()
+        except Exception:
+            pass
         GPIO.cleanup()
 
 

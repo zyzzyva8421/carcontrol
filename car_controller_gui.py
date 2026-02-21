@@ -83,6 +83,15 @@ class CarControllerGUI:
 
         self.pressed_keys: set[str] = set()
 
+        # Real-time status tab variables (must be before _build_ui)
+        self.rt_direction = tk.StringVar(value="-")
+        self.rt_speed = tk.StringVar(value="-")
+        self.rt_left_blocked = tk.StringVar(value="-")
+        self.rt_right_blocked = tk.StringVar(value="-")
+        self.rt_distance = tk.StringVar(value="-")
+        self.rt_too_close = tk.StringVar(value="-")
+        self.rt_obstacle = tk.StringVar(value="-")
+
         self._build_ui()
         # When websocket is enabled, try to fetch the token from the Pi
         # so the GUI is pre-filled with the correct secret. This uses the
@@ -90,6 +99,8 @@ class CarControllerGUI:
         self.ws_enabled_var.trace_add("write", lambda *a: self._on_ws_enabled_changed())
         self._bind_keys()
         self._schedule_sensor_refresh()
+
+        self._start_status_ws_client()
 
     def _on_ws_enabled_changed(self) -> None:
         if not self.ws_enabled_var.get():
@@ -188,9 +199,35 @@ class CarControllerGUI:
         drive_tab = ttk.Frame(tabs, padding=6)
         sensors_tab = ttk.Frame(tabs, padding=6)
         camera_tab = ttk.Frame(tabs, padding=6)
+        pi_status_tab = ttk.Frame(tabs, padding=6)
         tabs.add(drive_tab, text="Drive")
         tabs.add(sensors_tab, text="Sensors")
         tabs.add(camera_tab, text="Camera")
+        tabs.add(pi_status_tab, text="Pi Status")
+
+        # Pi Status tab content
+        status_grid = ttk.Frame(pi_status_tab, padding=8)
+        status_grid.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(status_grid, text="Direction:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_direction).grid(row=0, column=1, sticky="w")
+        ttk.Label(status_grid, text="Speed:").grid(row=1, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_speed).grid(row=1, column=1, sticky="w")
+        ttk.Label(status_grid, text="Left Blocked:").grid(row=2, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_left_blocked).grid(row=2, column=1, sticky="w")
+        ttk.Label(status_grid, text="Right Blocked:").grid(row=3, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_right_blocked).grid(row=3, column=1, sticky="w")
+        ttk.Label(status_grid, text="Distance:").grid(row=4, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_distance).grid(row=4, column=1, sticky="w")
+        ttk.Label(status_grid, text="Too Close:").grid(row=5, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_too_close).grid(row=5, column=1, sticky="w")
+        ttk.Label(status_grid, text="Obstacle:").grid(row=6, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_obstacle).grid(row=6, column=1, sticky="w")
+        ttk.Label(status_grid, text="Emergency Brake:").grid(row=7, column=0, sticky="w")
+        self.rt_emergency_brake = tk.StringVar(value="-")
+        ttk.Label(status_grid, textvariable=self.rt_emergency_brake).grid(row=7, column=1, sticky="w")
+        ttk.Label(status_grid, text="Ultrasonic Servo:").grid(row=8, column=0, sticky="w")
+        self.rt_ultra_servo = tk.StringVar(value="center")
+        ttk.Label(status_grid, textvariable=self.rt_ultra_servo).grid(row=8, column=1, sticky="w")
 
         controls_frame = ttk.LabelFrame(drive_tab, text="Controls", padding=6)
         controls_frame.grid(row=0, column=0, sticky="ew")
@@ -1192,6 +1229,37 @@ class CarControllerGUI:
                     self._schedule_camera_preview()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _start_status_ws_client(self):
+        def run_ws():
+            import asyncio
+            import websockets
+            import json
+            async def listen():
+                uri = "ws://" + self.host_var.get() + ":9000"
+                while True:
+                    try:
+                        async with websockets.connect(uri) as ws:
+                            while True:
+                                msg = await ws.recv()
+                                data = json.loads(msg)
+                                self.root.after(0, lambda d=data: self._update_rt_status(d))
+                    except Exception:
+                        time.sleep(2)
+            asyncio.run(listen())
+        threading.Thread(target=run_ws, daemon=True).start()
+
+    def _update_rt_status(self, data):
+        self.rt_direction.set(data.get("direction", "-"))
+        self.rt_speed.set(str(data.get("speed", "-")))
+        self.rt_left_blocked.set(str(data.get("left_blocked", "-")))
+        self.rt_right_blocked.set(str(data.get("right_blocked", "-")))
+        self.rt_distance.set(str(data.get("distance", "-")))
+        self.rt_too_close.set(str(data.get("too_close", "-")))
+        self.rt_obstacle.set(str(data.get("obstacle", "-")))
+        emergency_brake = data.get("emergency_brake", False)
+        self.rt_emergency_brake.set("ON" if emergency_brake else "OFF")
+        self.rt_ultra_servo.set(str(data.get("ultra_servo", "center")))
 
 
 def main() -> None:

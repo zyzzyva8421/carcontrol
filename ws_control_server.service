@@ -1,0 +1,13 @@
+[Unit]
+Description=WebSocket Control Server
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/ws_control_server.py --host 0.0.0.0 --port 8765 --token-file /home/pi/ws_token.txt
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

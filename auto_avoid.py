@@ -69,6 +69,7 @@ def build_parser():
     parser.add_argument('--loop-seconds', type=float, default=0.05)
     parser.add_argument('--back-seconds', type=float, default=0.20)
     parser.add_argument('--turn-seconds', type=float, default=0.30)
+    parser.add_argument('--turn-repeat-limit', type=int, default=3, help='Number of repeated left/right turns before backward escape')
     return parser
 
 def clamp(value, min_value, max_value):
@@ -269,7 +270,8 @@ def main():
         # Track repeated turns
         stuck_threshold = 10  # Number of cycles with no progress before stuck
         turn_count = 0
-        turn_repeat_limit = 3  # Move backward after 3 repeated turns
+        # Move backward after this many repeated left/right turns (corner escape)
+        turn_repeat_limit = getattr(args, 'turn_repeat_limit', 3)
         sweep_enabled = True  # Enable sweep logic
 
         prev_distance = None
@@ -473,15 +475,17 @@ def main():
                     turn_count = 1
                 last_turn = turn
 
-                # If stuck turning, try backward
+                # Corner escape: If stuck turning left/right, try backward
                 if turn_count >= turn_repeat_limit:
-                    print("[DEBUG] Too many repeated turns, moving backward.")
+                    print(f"[CORNER ESCAPE] {turn_count} repeated turns. Moving backward to escape corner.")
                     move_backward()
                     status["direction"] = "backward"
+                    status["corner"] = True
                     ws_broadcast_status(status)
                     time.sleep(back_seconds)
                     brake()
                     status["direction"] = "brake"
+                    status["corner"] = True
                     ws_broadcast_status(status)
                     time.sleep(0.05)
                     turn_count = 0  # Reset after backward

@@ -91,6 +91,8 @@ class CarControllerGUI:
         self.rt_distance = tk.StringVar(value="-")
         self.rt_too_close = tk.StringVar(value="-")
         self.rt_obstacle = tk.StringVar(value="-")
+        self.rt_stuck = tk.StringVar(value="-")
+        self.rt_corner = tk.StringVar(value="-")
 
         self._build_ui()
         # When websocket is enabled, try to fetch the token from the Pi
@@ -222,12 +224,16 @@ class CarControllerGUI:
         ttk.Label(status_grid, textvariable=self.rt_too_close).grid(row=5, column=1, sticky="w")
         ttk.Label(status_grid, text="Obstacle:").grid(row=6, column=0, sticky="w")
         ttk.Label(status_grid, textvariable=self.rt_obstacle).grid(row=6, column=1, sticky="w")
-        ttk.Label(status_grid, text="Emergency Brake:").grid(row=7, column=0, sticky="w")
+        ttk.Label(status_grid, text="Stuck:").grid(row=7, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_stuck).grid(row=7, column=1, sticky="w")
+        ttk.Label(status_grid, text="Corner Escape:").grid(row=8, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_corner).grid(row=8, column=1, sticky="w")
+        ttk.Label(status_grid, text="Emergency Brake:").grid(row=9, column=0, sticky="w")
         self.rt_emergency_brake = tk.StringVar(value="-")
-        ttk.Label(status_grid, textvariable=self.rt_emergency_brake).grid(row=7, column=1, sticky="w")
-        ttk.Label(status_grid, text="Ultrasonic Servo:").grid(row=8, column=0, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_emergency_brake).grid(row=9, column=1, sticky="w")
+        ttk.Label(status_grid, text="Ultrasonic Servo:").grid(row=10, column=0, sticky="w")
         self.rt_ultra_servo = tk.StringVar(value="center")
-        ttk.Label(status_grid, textvariable=self.rt_ultra_servo).grid(row=8, column=1, sticky="w")
+        ttk.Label(status_grid, textvariable=self.rt_ultra_servo).grid(row=10, column=1, sticky="w")
 
         controls_frame = ttk.LabelFrame(drive_tab, text="Controls", padding=6)
         controls_frame.grid(row=0, column=0, sticky="ew")
@@ -1257,6 +1263,16 @@ class CarControllerGUI:
         self.rt_distance.set(str(data.get("distance", "-")))
         self.rt_too_close.set(str(data.get("too_close", "-")))
         self.rt_obstacle.set(str(data.get("obstacle", "-")))
+        self.rt_stuck.set("YES" if data.get("stuck", False) else "NO")
+        # Corner escape: show YES if direction is 'backward' and stuck is False, or add a dedicated field if present
+        corner_escape = False
+        if "corner" in data:
+            corner_escape = data["corner"]
+        else:
+            # Heuristic: direction == 'backward' and not stuck
+            if data.get("direction", "") == "backward" and not data.get("stuck", False):
+                corner_escape = True
+        self.rt_corner.set("YES" if corner_escape else "NO")
         emergency_brake = data.get("emergency_brake", False)
         self.rt_emergency_brake.set("ON" if emergency_brake else "OFF")
         self.rt_ultra_servo.set(str(data.get("ultra_servo", "center")))

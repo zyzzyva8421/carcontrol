@@ -3,7 +3,7 @@ import socket
 import struct
 import pickle
 
-HOST = '192.168.2.21'  # Raspberry Pi's IP address
+HOST = '192.168.2.56'  # Raspberry Pi's IP address
 PORT = 9999  # Port to connect to
 
 def main():

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Dict
 
 
-DEFAULT_HOST = "192.168.2.21"
+DEFAULT_HOST = "192.168.2.56"
 DEFAULT_USER = "pi"
 
 

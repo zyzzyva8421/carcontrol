@@ -2,7 +2,7 @@
 """Simple WebSocket client to control Pi servos remotely.
 
 Usage examples:
-  python3 ws_control_client.py --host 192.168.2.21 --servo 3 --angle 80 --token secret-token
+  python3 ws_control_client.py --host 192.168.2.56 --servo 3 --angle 80 --token secret-token
 
 Sends a JSON message and prints the JSON response from the server.
 """
